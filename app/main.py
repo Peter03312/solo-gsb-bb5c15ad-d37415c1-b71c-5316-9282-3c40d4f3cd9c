@@ -856,27 +856,36 @@ def get_delivery_receipts(delivery_id: str) -> dict:
 def revoke_delivery(delivery_id: str, body: DeliveryRevocationIn) -> dict:
     """撤销某已持久化成功判定中尚未终结的终点任务。
 
-    请求体给出撤销原因（去空白后须非空）。一次操作在单个 BEGIN IMMEDIATE 事务内
-    核定该编号全部终点：已送达 / 永久失败的终点保留原回执（逐终点结果中标记
-    kept_terminal），其余终点标记撤销（revoked）并使现有租约立即失效；
-    全部终点已终结时返回 409 nothing_to_revoke 且不留任何记录。
-    同编号再次撤销原样返回首次操作的逐终点结果、时间与原因（不重复写入）。
-    未知编号（404 delivery_not_found）、原判定失败（409 delivery_decision_failed）、
-    空原因（422 invalid_reason）明确报错且不留记录。
+    幂等重放边界：事务内先查撤销记录——该编号已成功撤销时，无论本次提交的原因
+    是否为空、纯空白或与首次不同，都原样返回首次撤销记录（原因、时间、逐终点结果
+    与计数），不再对本次原因做任何校验，也不改写记录。
+    仅对尚无撤销记录的编号，才对原因去空白：去空白后为空返回 422 invalid_reason
+    且不留记录，随后在单个 BEGIN IMMEDIATE 事务内核定该编号全部终点：已送达 /
+    永久失败的终点保留原回执（逐终点结果中标记 kept_terminal），其余终点标记撤销
+    （revoked）并使现有租约立即失效；全部终点已终结时返回 409 nothing_to_revoke
+    且不留任何记录。
+    未知编号（404 delivery_not_found）、原判定失败（409 delivery_decision_failed）
+    的约束维持不变。
     撤销后：领取不再返回已撤销终点，直接回执的新尝试（409 endpoint_revoked）与
     令牌完成（409 invalid_lease_token / revoked）对其明确拒绝；判定重放、
     核对报表与熔断统计不受影响。
     """
-    reason = body.reason.strip()
-    if not reason:  # 去空白后为空：明确报错，不留记录
-        raise HTTPException(
-            status_code=422,
-            detail={"error": "invalid_reason", "delivery_id": delivery_id,
-                    "message": "revocation reason must be non-empty after stripping whitespace"},
-        )
     try:
         with db.transaction() as conn:
+            existing = store.get_revocation(conn, delivery_id)
+            if existing is not None:
+                # 已成功撤销：幂等重放，原样返回首次记录，本次原因不再校验或改写
+                return existing
+            reason = body.reason.strip()
+            if not reason:  # 尚无撤销记录：去空白后为空，明确报错，不留记录
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_reason", "delivery_id": delivery_id,
+                            "message": "revocation reason must be non-empty after stripping whitespace"},
+                )
             revocation = store.revoke_delivery(conn, delivery_id, reason)
+    except HTTPException:
+        raise
     except KeyError:
         raise HTTPException(
             status_code=404,

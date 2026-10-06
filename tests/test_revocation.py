@@ -192,6 +192,33 @@ def test_revoke_replay_returns_first_operation_verbatim(client):
     assert client.get("/deliveries/msg-1/revocation").json() == first
 
 
+@pytest.mark.parametrize("replay_reason", ["", "   ", "\t\n ", "  different reason  "])
+def test_revoke_replay_with_blank_or_changed_reason_returns_first_record(client, replay_reason):
+    # 已成功撤销后再次提交：即使本次原因为空 / 纯空白 / 与首次不同，也原样返回首次
+    # 记录（原因、时间、逐终点结果与计数），不再次校验或改写原因
+    setup(client)
+    submit(client, "msg-1")
+    first = revoke(client, "msg-1", "  first reason  ").json()
+    assert first["reason"] == "first reason"
+    replay = revoke(client, "msg-1", replay_reason)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first
+    assert client.get("/deliveries/msg-1/revocation").json() == first
+    # 存储中的原因与计数仍以首次为准，未被改写
+    stored = client.get("/deliveries/msg-1/revocation").json()
+    assert stored["reason"] == "first reason" and stored["revoked_count"] == 2
+
+
+def test_revoke_replay_with_oversized_reason_is_not_revalidated(client):
+    # 模型层不再按长度校验：首次记录存在时，超长原因的重放仍原样返回
+    setup(client)
+    submit(client, "msg-1")
+    first = revoke(client, "msg-1", "short").json()
+    replay = revoke(client, "msg-1", "x" * 5000)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first
+
+
 def test_concurrent_revokes_converge_to_first_record(client):
     setup(client)
     submit(client, "msg-1")
@@ -243,6 +270,37 @@ def test_revoke_blank_reason_422_and_no_record(client, reason):
     assert client.get("/deliveries/msg-1/revocation").status_code == 404
     # 修正后可用同一编号正常撤销
     assert revoke(client, "msg-1", "now a real reason").status_code == 200
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\t\n "])
+def test_blank_reason_on_unknown_and_failed_and_terminal_deliveries_still_rejected(client, reason):
+    # 尚无撤销记录时先去空白：空原因对未知编号 / 失败判定 / 全部终结编号同样 422，
+    # 且不改变这些编号既有的无记录状态（后续非空原因仍按原约束处理）
+    setup(client)
+    submit(client, "msg-1")
+    bad_resp = client.post(
+        "/deliveries", json={"delivery_id": "msg-bad", "address": "blocked@corp.example.com"}
+    )
+    assert bad_resp.status_code == 422  # 失败判定同样持久化
+    assert receipt(client, "msg-1", "alice@mail.example.com", 1, "delivered").status_code == 200
+    assert receipt(client, "msg-1", "bob@mail.example.com", 1, "permanent_failure").status_code == 200
+
+    assert revoke(client, "nope", reason).status_code == 422
+    assert revoke(client, "msg-bad", reason).status_code == 422
+    assert revoke(client, "msg-1", reason).status_code == 422
+
+    # 非空原因后，既有未知编号（404）、失败判定（409）、全终结（409）约束保持不变
+    assert revoke(client, "nope", "real reason").status_code == 404
+    bad = revoke(client, "msg-bad", "real reason")
+    assert bad.status_code == 409 and bad.json()["detail"]["error"] == "delivery_decision_failed"
+    terminal = revoke(client, "msg-1", "real reason")
+    assert terminal.status_code == 409 and terminal.json()["detail"]["error"] == "nothing_to_revoke"
+    # 全程未留任何撤销记录
+    for delivery_id in ("nope", "msg-bad", "msg-1"):
+        got = client.get(f"/deliveries/{delivery_id}/revocation")
+        assert got.status_code == 404 and got.json()["detail"]["error"] in (
+            "delivery_not_found", "revocation_not_found",
+        )
 
 
 def test_get_revocation_404_when_none(client):

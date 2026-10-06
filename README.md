@@ -103,16 +103,19 @@
   发放新任务；调高 / 新设 / 删除上限立即对后续领取生效。领取与配置变更都在单个
   `BEGIN IMMEDIATE` 事务内原子核对，并发下绝不超额；既有回执、令牌完成、判定与报表接口
   的请求 / 响应形状保持不变。
-- **终点任务撤销**：投递操作方用 `POST /deliveries/{id}/revocation` 提交**去空白后非空的
-  撤销原因**，在单个 `BEGIN IMMEDIATE` 事务内对该编号全部终点一次性核定：**已送达 /
-  永久失败的终点保留原回执**（逐终点结果标记 `kept_terminal`），其余终点**标记撤销
-  （`revoked`）并使现有租约立即失效**；全部终点已终结时返回 `409 nothing_to_revoke`
-  且**不留撤销记录**。同编号再次撤销**原样返回首次操作的逐终点结果、时间与原因**
-  （幂等重放，不重复写入）。撤销后：领取不再返回已撤销终点、被撤销租约的域名在途名额
-  立即释放；直接回执的**新尝试**（`409 endpoint_revoked`）与**令牌完成**
-  （`409 invalid_lease_token`，`reason=revoked`）对其明确拒绝；**已记录回执的同序号
-  同结果重试仍原样返回**。未知编号（404）、原判定失败（409）、空原因（422）明确报错
-  且不留记录。`GET /deliveries/{id}/revocation` 可查询撤销结果；既有判定重放、
+- **终点任务撤销**：投递操作方用 `POST /deliveries/{id}/revocation` 提交撤销原因，
+  接口在单个 `BEGIN IMMEDIATE` 事务内**先查该编号是否已有撤销记录**：已有记录时
+  （幂等重放）**无论本次原因是否为空、纯空白或与首次不同，都原样返回首次记录的
+  原因、时间、逐终点结果与计数，不再校验或改写原因**；仅对尚无撤销记录的编号才
+  把原因去空白核定——空原因返回 `422 invalid_reason` 且不留记录，非空则对该编号
+  全部终点一次性核定：**已送达 / 永久失败的终点保留原回执**（逐终点结果标记
+  `kept_terminal`），其余终点**标记撤销（`revoked`）并使现有租约立即失效**；
+  全部终点已终结时返回 `409 nothing_to_revoke` 且**不留撤销记录**。撤销后：领取
+  不再返回已撤销终点、被撤销租约的域名在途名额立即释放；直接回执的**新尝试**
+  （`409 endpoint_revoked`）与**令牌完成**（`409 invalid_lease_token`，
+  `reason=revoked`）对其明确拒绝；**已记录回执的同序号同结果重试仍原样返回**。
+  未知编号（404）、原判定失败（409）在原因核定之前即按既有约束报错。
+  `GET /deliveries/{id}/revocation` 可查询撤销结果；既有判定重放、
   历史报表与熔断统计不变，回执查询仍只反映实际尝试。
 
 ## 一键启动（Docker Compose）
@@ -174,7 +177,7 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
 | POST | `/deliveries/{id}/receipts` | 投递结果回执：按终点 + 正整数序号回传实际投递结果 |
 | GET  | `/deliveries/{id}/receipts` | 查询各终点尝试记录（按序号升序）与汇总状态         |
-| POST | `/deliveries/{id}/revocation` | 撤销成功判定中尚未终结的终点任务（需非空原因；同编号重放首次结果） |
+| POST | `/deliveries/{id}/revocation` | 撤销成功判定中尚未终结的终点任务（无记录时需非空原因；已撤销编号重放原样返回首次记录，忽略本次原因） |
 | GET  | `/deliveries/{id}/revocation` | 查询某投递编号的撤销结果（未撤销或无可撤销项时 404） |
 | POST | `/deliveries/claims`        | 投递任务领取：按到期时刻/编号/终点排序领取终点任务并设租约 |
 | POST | `/deliveries/claims/{token}/complete` | 凭有效租约令牌提交回执，原子写入并结束租约   |
@@ -1174,7 +1177,8 @@ curl -X DELETE http://localhost:8000/deliveries/claims/domain-limits/mail.exampl
 
 ### 25. 撤销（POST /deliveries/{id}/revocation）
 
-请求体只需**去空白后非空**的撤销原因：
+请求体给出撤销原因。**仅当该编号尚无撤销记录时**，原因才会被去空白并要求非空；
+已撤销编号的重放请求原样返回首次记录，本次原因（即使为空或不同）被完全忽略：
 
 ```bash
 curl -X POST http://localhost:8000/deliveries/msg-2026-10-05-1001/revocation \
@@ -1198,12 +1202,15 @@ curl -X POST http://localhost:8000/deliveries/msg-2026-10-05-1001/revocation \
 - `endpoints` 按判定中的终点顺序给出**逐终点结果**：`kept_terminal` 表示该终点
   已有终结回执（已送达 / 永久失败），**原回执保留**（附终结结果与序号）；
   `revoked` 表示该终点（无回执或最新为暂时失败）**已标记撤销**，其现有租约立即失效。
-- **同编号再次撤销原样返回首次操作**的逐终点结果、时间与原因（即使再次提交的原因
-  不同），不重复写入；`GET /deliveries/{id}/revocation` 返回同一记录。
+- **同编号再次撤销原样返回首次操作**的逐终点结果、时间、原因与计数——事务先查
+  记录，因此**无论本次提交的原因是空串、纯空白还是与首次不同，都不再校验或改写
+  原因**（也不受长度限制），不重复写入；`GET /deliveries/{id}/revocation` 返回
+  同一记录。并发撤销按事务提交顺序收敛为同一份首次记录。
 - **全部终点已终结** → `409 {"error": "nothing_to_revoke", "endpoints": [...]}`
   （附各终点终结结果），**不留撤销记录**（之后 `GET` 仍 404，再次撤销仍是 409）。
 - **明确报错且不留记录**：未知编号 → `404 delivery_not_found`；原判定失败 →
-  `409 delivery_decision_failed`；原因去空白后为空 → `422 invalid_reason`。
+  `409 delivery_decision_failed`（两者在原因核定之前即返回）；**尚无撤销记录时**
+  原因去空白后为空 → `422 invalid_reason`。
 
 ### 26. 撤销后的行为与查询
 

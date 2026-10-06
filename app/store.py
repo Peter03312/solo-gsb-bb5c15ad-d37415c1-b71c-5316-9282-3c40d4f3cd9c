@@ -1263,12 +1263,15 @@ def revoke_delivery(conn: sqlite3.Connection, delivery_id: str, reason: str) -> 
     """撤销某成功判定中尚未终结的终点任务。须在 BEGIN IMMEDIATE 写事务内调用。
 
     - 已有撤销记录 → 原样返回首次操作的逐终点结果、时间与原因（幂等重放，不重写）；
+      此检查也是并发撤销的收敛点：与调用方事务入口处的重放短路配合，多个并发请求
+      只有第一个写入，其余（含原因不同或为空者）全部读到首次记录。
     - 未知编号 → KeyError；原判定失败 → ReceiptDecisionFailed；
     - 全部终点已终结 → NothingToRevoke（不留任何记录）；
     - 否则：非终结终点写入 delivery_endpoint_revocations（领取 / 租约 / 新回执随即
       对其关闭），终结终点保留原回执；把逐终点结果快照与原因写入
       delivery_revocations 并返回首次操作的完整结果。
-    reason 须已由调用方去空白并确认非空。
+    reason 是否非空由路由层在“确认尚无撤销记录”之后去空白核定（已撤销编号的重放
+    在进入本函数前即原样返回，不校验原因）；走到这里的 reason 必为非空。
     """
     existing = get_revocation(conn, delivery_id)
     if existing is not None:  # 同编号再次撤销：原样返回首次记录，不重复写入
