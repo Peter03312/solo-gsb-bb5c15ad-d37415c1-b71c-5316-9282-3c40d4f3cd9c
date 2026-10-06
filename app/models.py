@@ -120,9 +120,10 @@ class LeaseCompleteIn(BaseModel):
 
 
 class DeliveryRevocationIn(BaseModel):
-    """撤销某成功判定中尚未终结的终点任务：撤销原因（去空白后须非空，由服务端核定）。"""
+    """撤销某成功判定中尚未终结的终点任务：撤销原因（尚无撤销记录时去空白后须非空，
+    由服务端核定；已有记录的编号原样重放首次记录，不再校验原因）。"""
 
-    reason: str = Field(max_length=500, description="撤销原因（去空白后须非空）")
+    reason: str = Field(max_length=500, description="撤销原因（尚无撤销记录时去空白后须非空）")
 
 
 class DomainClaimLimitIn(BaseModel):

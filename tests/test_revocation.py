@@ -3,9 +3,11 @@
 一次操作在事务内核定该编号全部终点：已送达 / 永久失败的终点保留原回执
 （kept_terminal），其余终点标记撤销（revoked）并使现有租约失效；全部终点已终结
 返回 409 nothing_to_revoke 且不留记录。同编号再次撤销原样返回首次操作的逐终点
-结果、时间与原因。撤销后领取不再返回已撤销终点，直接回执的新尝试与令牌完成
+结果、时间与原因——无论本次原因为空还是与首次不同，都不再校验原因；仅尚无
+撤销记录的编号才校验空原因（422 且不留记录）。撤销后领取不再返回已撤销终点，
+直接回执的新尝试与令牌完成
 明确拒绝，已记录回执的同序号同结果重试仍原样返回。未知编号（404）、原判定失败
-（409）、空原因（422）明确报错且不留记录。判定重放、历史报表与熔断统计不变，
+（409）明确报错且不留记录。判定重放、历史报表与熔断统计不变，
 回执查询仍只反映实际尝试。
 """
 import os
@@ -190,6 +192,37 @@ def test_revoke_replay_returns_first_operation_verbatim(client):
     assert again.status_code == 200
     assert again.json() == first  # 首次操作的逐终点结果、时间与原因
     assert client.get("/deliveries/msg-1/revocation").json() == first
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\t\n "])
+def test_revoke_replay_with_blank_reason_returns_first_record(client, reason):
+    setup(client)
+    submit(client, "msg-1")
+    first = revoke(client, "msg-1", "first reason").json()
+    # 已成功撤销后：本次原因为空也不再校验，原样返回首次记录（原因、时间、逐终点结果与计数）
+    again = revoke(client, "msg-1", reason)
+    assert again.status_code == 200
+    assert again.json() == first
+    assert again.json()["reason"] == "first reason"
+    assert client.get("/deliveries/msg-1/revocation").json() == first
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\t\n "])
+def test_blank_reason_still_422_when_no_revocation_record(client, reason):
+    setup(client)
+    # 未知编号：无撤销记录，空原因仍先 422（而非 404），不留记录
+    resp = revoke(client, "nope", reason)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_reason"
+    # 全部终点已终结（无可撤销项、不留记录）：空原因仍 422，非空原因才是 nothing_to_revoke
+    submit(client, "msg-1")
+    assert receipt(client, "msg-1", "alice@mail.example.com", 1, "delivered").status_code == 200
+    assert receipt(client, "msg-1", "bob@mail.example.com", 1, "permanent_failure").status_code == 200
+    resp = revoke(client, "msg-1", reason)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_reason"
+    assert revoke(client, "msg-1", "too late").status_code == 409
+    assert client.get("/deliveries/msg-1/revocation").status_code == 404
 
 
 def test_concurrent_revokes_converge_to_first_record(client):
